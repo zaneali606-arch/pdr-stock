@@ -86,12 +86,24 @@ def log_error(text):
         with ERROR_LOG_FILE.open('a', encoding='utf-8') as f: f.write(text if text.endswith('\n') else text + '\n')
     except Exception: pass
 
-
 def load_token():
-    # 1. البحث أولاً في متغيرات البيئة (Render Environment Variables)
-    token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-    if token:
-        return token.strip()
+  # 1. البحث أولاً في متغيرات البيئة (Render Environment Variables)
+  token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+  if token:
+    return token.strip()
+
+  # 2. إذا لم يوجد في المتغيرات، البحث محلياً عن ملف token.txt
+  if TOKEN_FILE.exists():
+    return TOKEN_FILE.read_text(encoding="utf-8-sig").strip()
+
+  # 3. إذا لم يوجد نهائياً
+  raise RuntimeError(
+      "Token introuvable : veuillez configurer BOT_TOKEN dans les"
+      " variables d'environnement Render."
+  )
+
+
+TOKEN = load_token()
     
     # 2. إذا لم يوجد في المتغيرات، البحث محلياً عن ملف token.txt (للتجربة على حاسوبك)
     if TOKEN_FILE.exists():
