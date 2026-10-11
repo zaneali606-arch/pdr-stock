@@ -1,0 +1,1463 @@
+# -*- coding: utf-8 -*-
+"""PDR-STOCK Telegram bot — Excel workbook is not restructured or reformatted.
+Movement writes are limited to input columns on the existing ENTRÉES/SORTIES sheets.
+Requires Windows + Excel + pywin32; optional: opencv-python, Pillow.
+
+Excel COM notes (fix for error -2147418111 "L'appel a été rejeté par l'appelé"):
+  * The workbook has a Workbook_Open macro that shows a MsgBox ("Succes").  In a hidden Excel
+    instance that dialog blocks every COM call.  When the bot starts its OWN Excel instance it
+    now opens the workbook with events disabled (Workbook_Open does not run), then re-enables
+    events before writing so the workbook's own save/audit macros behave as usual.
+  * If the workbook is already open in the user's Excel, the bot reuses that session and never
+    closes it or quits Excel.  Only an Excel instance created by the bot is closed by the bot.
+  * Every COM call is retried with a growing delay when Excel answers "busy/rejected".
+"""
+from __future__ import annotations
+import os, io, json, time, re, shutil, hashlib, traceback, urllib.parse, urllib.request, urllib.error
+from pathlib import Path
+from datetime import datetime, timedelta
+
+BASE_DIR = Path(__file__).resolve().parent
+EXCEL_NAME = os.environ.get('PDR_EXCEL_NAME', 'Gds_WITH_QR_DATA_complete_CORRIGE sboa.xlsm')
+EXCEL_FILE = BASE_DIR / EXCEL_NAME
+# If Windows/Explorer added a suffix such as (2), locate the existing workbook without editing it.
+if not EXCEL_FILE.exists():
+    _candidates = sorted(BASE_DIR.glob('Gds_WITH_QR_DATA_complete_CORRIGE sboa*.xlsm'))
+    if len(_candidates) == 1:
+        EXCEL_FILE = _candidates[0]
+IMAGES_DIR = BASE_DIR / 'IMAGES'
+PENDING_DIR = BASE_DIR / 'IMAGES_PENDING'
+REJECTED_DIR = BASE_DIR / 'IMAGES_REJECTED'
+BACKUP_DIR = BASE_DIR / 'IMAGES_BACKUP'
+TOKEN_FILE = BASE_DIR / 'token.txt'
+OFFSET_FILE = BASE_DIR / 'telegram_offset.txt'
+USERS_FILE = BASE_DIR / 'pdr_stock_users.json'
+AUDIT_FILE = BASE_DIR / 'bot_audit.jsonl'
+PHOTO_PERMS_FILE = BASE_DIR / 'pdr_stock_photo_perms.json'   # IDs allowed to publish photos without approval
+ERROR_LOG_FILE = BASE_DIR / 'bot_errors.log'
+OWNER_USER_ID = 8321752547
+BOT_VERSION = 'v4 - rapport mensuel (choix du mois) + alertes achat'
+SHEET_STOCK = '📦 STOCK'
+SHEET_ENTRIES = '📥 ENTRÉES'
+SHEET_EXITS = '📤 SORTIES'
+HEADER_ROW = 4
+DATA_ROW = 5
+MOVE_LAST_ROW = 3004          # movement sheets: data rows 5..3004 (row 3007 is a menu row)
+MOVE_CATEGORY = 'PDR'         # STOCK!L only counts movements whose column A = "PDR"
+SEARCH_LIMIT = 30             # text / partial-code search: up to 30 lines (code + name)
+IMAGE_SEARCH_LIMIT = 20       # photo search: the 20 closest photos of the IMAGES folder
+PHOTO_MAX_SIDE = 1280         # new photos: longest side in pixels (Telegram shows at most ~1280 px anyway)
+PHOTO_JPEG_QUALITY = 88       # new photos: JPEG quality (85-90 is visually lossless for part photos)
+IMAGE_EXACT_MAX = 6           # photo search: 8x8-hash distance (0..64) at or below which the photo is treated as THE same part
+IMAGE_EXACT_GAP = 3           # ...and it must beat the 2nd closest photo by at least this many bits (otherwise it stays a list)
+NOT_FOUND = '🔴'
+ROLE_LABELS = {'admin':'Administrateur', 'responsable':'Responsable', 'magasinier':'Magasinier', 'maintenance':'Maintenance'}
+
+for d in (IMAGES_DIR, PENDING_DIR, REJECTED_DIR, BACKUP_DIR): d.mkdir(exist_ok=True)
+
+try:
+    import win32com.client
+except Exception:
+    win32com = None
+try:
+    import pythoncom
+except Exception:
+    pythoncom = None
+try:
+    import cv2
+    import numpy as np
+except Exception:
+    cv2 = np = None
+try:
+    from PIL import Image, ImageOps
+except Exception:
+    Image = ImageOps = None
+
+
+def log_event(event, **data):
+    rec = {'time': datetime.now().isoformat(timespec='seconds'), 'event': event, **data}
+    try:
+        with AUDIT_FILE.open('a', encoding='utf-8') as f: f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+    except Exception: pass
+
+
+def log_error(text):
+    try:
+        with ERROR_LOG_FILE.open('a', encoding='utf-8') as f: f.write(text if text.endswith('\n') else text + '\n')
+    except Exception: pass
+
+
+def load_token():
+    if not TOKEN_FILE.exists(): raise RuntimeError(f'Fichier token introuvable : {TOKEN_FILE}')
+    token = TOKEN_FILE.read_text(encoding='utf-8-sig').strip()
+    if not token or ':' not in token: raise RuntimeError('Le fichier token.txt ne contient pas un token Telegram valide.')
+    return token
+TOKEN = load_token()
+API = f'https://api.telegram.org/bot{TOKEN}/'
+
+
+def api(method, data=None, files=None, timeout=40):
+    data = data or {}
+    if files:
+        boundary = '----PDRStock' + hashlib.md5(str(time.time()).encode()).hexdigest()
+        body = bytearray()
+        for k, v in data.items():
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n').encode()
+        for k, item in files.items():
+            filename, content, mime = item
+            body += (f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"; filename="{filename}"\r\nContent-Type: {mime}\r\n\r\n').encode()
+            body += content + b'\r\n'
+        body += f'--{boundary}--\r\n'.encode()
+        req = urllib.request.Request(API+method, data=bytes(body), headers={'Content-Type':f'multipart/form-data; boundary={boundary}'})
+    else:
+        payload = urllib.parse.urlencode({k: json.dumps(v, ensure_ascii=False) if isinstance(v,(dict,list)) else str(v) for k,v in data.items()}).encode()
+        req = urllib.request.Request(API+method, data=payload)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r: result = json.loads(r.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode('utf-8', 'replace')
+        raise RuntimeError(f'Telegram API {method}: HTTP {e.code} {msg[:500]}')
+    if not result.get('ok'): raise RuntimeError(f'Telegram API {method}: {result}')
+    return result.get('result')
+
+
+def send(chat_id, text, keyboard=None, parse_mode='HTML'):
+    payload = {'chat_id':chat_id, 'text':text, 'parse_mode':parse_mode, 'disable_web_page_preview':True}
+    if keyboard: payload['reply_markup'] = keyboard
+    # Telegram message limit
+    if len(text) > 3900: text = text[:3850] + '\n… (résultat raccourci)'
+    payload['text'] = text
+    return api('sendMessage', payload)
+
+
+def inline(rows): return {'inline_keyboard': rows}
+def btn(label, data): return {'text':label, 'callback_data':data[:64]}
+def esc(x):
+    import html
+    return html.escape('' if x is None else str(x))
+def norm(x): return re.sub(r'\s+', ' ', str(x or '').strip()).casefold()
+def as_text(v):
+    if v is None: return ''
+    if isinstance(v, float) and v.is_integer(): return str(int(v))
+    if hasattr(v, 'strftime'): return v.strftime('%d/%m/%Y')
+    return str(v).strip()
+def as_num(v):
+    try: return float(v or 0)
+    except Exception: return 0.0
+
+
+def display_name(user):
+    parts = [user.get('first_name',''), user.get('last_name','')]
+    name = ' '.join(p.strip() for p in parts if p and p.strip())
+    if name: return name
+    if user.get('username'): return '@'+user['username']
+    return str(user.get('id','Utilisateur Telegram'))
+
+
+def load_users():
+    try: data = json.loads(USERS_FILE.read_text(encoding='utf-8'))
+    except Exception: data = {}
+    if not isinstance(data, dict): data = {}
+    data[str(OWNER_USER_ID)] = 'admin'
+    return data
+
+def save_users(users):
+    users[str(OWNER_USER_ID)] = 'admin'
+    USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding='utf-8')
+
+def role_of(uid): return load_users().get(str(uid))
+def is_admin(uid): return role_of(uid) == 'admin'
+def can_search(role): return role in ('admin','responsable','magasinier','maintenance')
+def can_move(role): return role in ('admin','responsable','magasinier')
+def can_see_full(role): return role in ('admin','responsable')
+def can_submit_photo(role): return role in ('admin','responsable','magasinier')
+def can_approve(role): return role in ('admin','responsable')
+
+def load_photo_perms():
+    try: data = json.loads(PHOTO_PERMS_FILE.read_text(encoding='utf-8'))
+    except Exception: data = []
+    return {str(x) for x in data} if isinstance(data, list) else set()
+
+def save_photo_perms(perms):
+    PHOTO_PERMS_FILE.write_text(json.dumps(sorted(perms), ensure_ascii=False, indent=2), encoding='utf-8')
+
+def is_photo_direct(uid, role):
+    """Photos go live without approval for roles that can approve (admin/responsable) and for IDs granted by the Admin."""
+    return can_approve(role) or str(uid) in load_photo_perms()
+
+
+def main_keyboard(role):
+    rows = [[{'text':'🔎 Rechercher article'},{'text':'📷 Recherche par photo'}], [{'text':'📥 Entrée'},{'text':'📤 Sortie'}]]
+    if role == 'maintenance': rows = [[{'text':'🔎 Rechercher article'},{'text':'📷 Recherche par photo'}], [{'text':'📷 Scanner QR'}]]
+    if not can_move(role): rows = [[{'text':'🔎 Rechercher article'},{'text':'📷 Recherche par photo'}], [{'text':'📷 Scanner QR'}]]
+    if can_see_full(role): rows.append([{'text':'📅 Rapport mensuel'},{'text':'🛒 Alertes achat'}])
+    if can_submit_photo(role): rows.append([{'text':'🖼️ Envoyer une photo'}])
+    if can_approve(role): rows.append([{'text':'🕓 Photos en attente'}])
+    # 👥 Utilisateurs n'est plus un bouton du bas d'écran (doublon) : il est accessible par la commande /utilisateurs.
+    return {'keyboard':rows, 'resize_keyboard':True}
+
+
+# Commands shown in the Telegram "/" menu (/search, /entre, /sortie are NOT listed: the keyboard buttons already do the job;
+# they still work if typed). Admins get extra commands (set per chat, so other users never see them).
+DEFAULT_COMMANDS = [
+    {'command':'start',  'description':'Démarrer le bot et afficher le menu'},
+    {'command':'aide',   'description':"Afficher le guide d'utilisation"},
+]
+ADMIN_COMMANDS = [
+    {'command':'utilisateurs', 'description':'Gérer les utilisateurs, rôles et photos'},
+    {'command':'operations',   'description':'Voir les dernières entrées/sorties'},
+    {'command':'rapport',      'description':'Rapport mensuel (entrées, sorties, stock)'},
+    {'command':'achats',       'description':'Alertes d’achat (ruptures et stocks critiques)'},
+]
+
+def refresh_commands_for(uid, role):
+    """Set the / menu of one person: admins get the extra commands, everyone else the default list."""
+    try:
+        if role == 'admin':
+            api('setMyCommands', {'commands': DEFAULT_COMMANDS + ADMIN_COMMANDS, 'scope': {'type':'chat','chat_id':int(uid)}})
+        else:
+            api('deleteMyCommands', {'scope': {'type':'chat','chat_id':int(uid)}})
+    except Exception as e: log_error(f'{datetime.now().isoformat(timespec="seconds")} | setMyCommands({uid}) | {e!r}')
+
+def setup_commands():
+    try: api('setMyCommands', {'commands': DEFAULT_COMMANDS})
+    except Exception as e: log_error(f'{datetime.now().isoformat(timespec="seconds")} | setMyCommands | {e!r}')
+    for u, r in load_users().items():
+        if r == 'admin' and str(u).isdigit(): refresh_commands_for(u, r)
+
+
+# ======================================================================================
+# Excel COM layer
+# ======================================================================================
+# RPC_E_CALL_REJECTED (0x80010001) and RPC_E_SERVERCALL_RETRYLATER (0x8001010A):
+# Excel is busy (modal dialog, cell being edited, loading, calculating...).
+RPC_RETRY_CODES = {-2147418111, -2147417846}
+
+
+class ExcelBusyError(RuntimeError):
+    pass
+
+
+def _hresult(exc):
+    try:
+        args = exc.args
+        if args and isinstance(args[0], int): return args[0]
+    except Exception: pass
+    return getattr(exc, 'hresult', None)
+
+
+def com_retry(fn, *args, tries=14, **kwargs):
+    """Call fn(*args, **kwargs); retry with a growing delay while Excel answers 'busy/rejected'."""
+    delay = 0.4
+    for attempt in range(tries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if _hresult(e) not in RPC_RETRY_CODES: raise
+            if attempt == tries - 1:
+                raise ExcelBusyError('Excel est occupé (boîte de dialogue ouverte ou cellule en cours de modification). '
+                                     'Fermez la boîte de dialogue / validez la cellule dans Excel, puis réessayez.') from e
+            time.sleep(delay); delay = min(delay * 1.6, 4.0)
+
+
+def norm_path(path):
+    try: return os.path.normcase(os.path.normpath(os.path.abspath(str(path))))
+    except Exception: return str(path).lower()
+
+
+def _find_open_workbook(target):
+    """Return (app, wb) if the workbook is already open in a running Excel (the user's session), else None.
+    Looks through the Running Object Table (any Excel instance), then GetActiveObject. Never opens anything."""
+    if win32com is None: return None
+    if pythoncom is not None:
+        try:
+            rot = pythoncom.GetRunningObjectTable(); ctx = pythoncom.CreateBindCtx(0); monikers = list(rot.EnumRunning())
+        except Exception:
+            rot = ctx = None; monikers = []
+        for mk in monikers:
+            try:
+                if norm_path(mk.GetDisplayName(ctx, None)) != target: continue
+                disp = rot.GetObject(mk).QueryInterface(pythoncom.IID_IDispatch)
+                wb = win32com.client.Dispatch(disp)
+                app = com_retry(lambda: wb.Application)
+                com_retry(lambda: wb.FullName)
+                return app, wb
+            except ExcelBusyError: raise
+            except Exception: continue
+    try:
+        app = win32com.client.GetActiveObject('Excel.Application')
+        count = com_retry(lambda: app.Workbooks.Count)
+        for i in range(1, count + 1):
+            wb = com_retry(lambda i=i: app.Workbooks(i))
+            try:
+                if norm_path(com_retry(lambda: wb.FullName)) == target: return app, wb
+            except ExcelBusyError: raise
+            except Exception: pass
+    except ExcelBusyError: raise
+    except Exception: pass
+    return None
+
+
+def excel_open():
+    """Return (app, wb, owned). owned=True only when the bot created the Excel instance itself."""
+    if os.name != 'nt' or win32com is None:
+        raise RuntimeError('Lecture/écriture Excel via COM nécessite Windows, Excel et pywin32.')
+    if not EXCEL_FILE.exists(): raise RuntimeError(f'Classeur introuvable : {EXCEL_FILE.name}. Placez le bot dans le même dossier que le classeur.')
+    found = _find_open_workbook(norm_path(EXCEL_FILE))
+    if found:
+        return found[0], found[1], False        # user's own session: never closed, never quit
+    app = win32com.client.DispatchEx('Excel.Application')   # separate instance, never touches the user's Excel
+    try:
+        for name, value in (('Visible', False), ('DisplayAlerts', False), ('AskToUpdateLinks', False)):
+            try: com_retry(setattr, app, name, value)
+            except ExcelBusyError: raise
+            except Exception: pass
+        # Events OFF while opening: Workbook_Open (dashboard macro with MsgBox) must not run in a hidden Excel.
+        com_retry(setattr, app, 'EnableEvents', False)
+        wb = com_retry(app.Workbooks.Open, str(EXCEL_FILE), UpdateLinks=0, ReadOnly=False, IgnoreReadOnlyRecommended=True)
+        # Events back ON: the workbook's own BeforeSave/SheetChange macros behave as when a user edits it.
+        com_retry(setattr, app, 'EnableEvents', True)
+    except Exception:
+        try: app.Quit()
+        except Exception: pass
+        raise
+    return app, wb, True
+
+
+class ExcelSession:
+    """with ExcelSession() as xl: xl.app, xl.wb, xl.owned.  Closes only what the bot itself opened."""
+    def __init__(self): self.app = self.wb = None; self.owned = False
+    def __enter__(self):
+        self.app, self.wb, self.owned = excel_open()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if self.owned:
+            try: com_retry(self.wb.Close, SaveChanges=False)   # changes are saved explicitly with wb.Save()
+            except Exception: pass
+            try: self.app.Quit()
+            except Exception: pass
+        return False
+
+
+def find_sheet(wb, exact):
+    count = com_retry(lambda: wb.Worksheets.Count)
+    sheets = []
+    for i in range(1, count + 1):
+        sh = com_retry(lambda i=i: wb.Worksheets(i))
+        sheets.append((str(com_retry(lambda: sh.Name)), sh))
+    for name, sh in sheets:
+        if name.strip() == exact: return sh
+    # fallback: sheet names may render emoji differently
+    target = norm(exact)
+    for name, sh in sheets:
+        if norm(name) == target or exact.split(' ',1)[-1].casefold() in norm(name): return sh
+    raise RuntimeError(f'Feuille Excel introuvable : {exact}')
+
+
+def article_from_row(vals):
+    # STOCK columns A:W: A code, B designation, C line, D machine, E manufacturer, F old no, G location,
+    # H initial qty, I min, J max, K price, L available, M value, N alert, Q QR text, S discrepancy, T consumption, U days, V ABC, W SAP qty.
+    def get(i): return vals[i-1] if len(vals)>=i else None
+    return {'code':as_text(get(1)), 'code_raw':get(1), 'designation':as_text(get(2)), 'ligne':as_text(get(3)), 'machine':as_text(get(4)),
+            'constructeur':as_text(get(5)), 'ancien':as_text(get(6)), 'emplacement':as_text(get(7)), 'initial':get(8),
+            'min':get(9), 'max':get(10), 'prix':get(11), 'stock':get(12), 'valeur':get(13), 'alerte':get(14),
+            'qr':as_text(get(17)), 'ecart':get(19), 'conso30':get(20), 'jours':get(21), 'abc':as_text(get(22)), 'sap':get(23)}
+
+
+def read_stock_values(wb):
+    sh = find_sheet(wb, SHEET_STOCK)
+    last = com_retry(lambda: sh.Cells(sh.Rows.Count, 1).End(-4162).Row)  # xlUp
+    last = min(max(last, DATA_ROW), 200000)
+    # Read A:W in one COM call to avoid slow cell-by-cell access
+    values = com_retry(lambda: sh.Range(f'A{DATA_ROW}:W{last}').Value)
+    return sh, values
+
+
+def match_articles(values, query, limit=15):
+    q = norm(query)
+    if not q: return []
+    found = []
+    for idx, row in enumerate(values or []):
+        if not row: continue
+        a = article_from_row(row)
+        if not a['code']: continue
+        code = norm(a['code']); designation = norm(a['designation'])
+        if code == q: score = 0
+        elif code.startswith(q): score = 1
+        elif q in code: score = 2
+        elif q in designation: score = 3
+        elif q in norm(a['ligne']) or q in norm(a['machine']) or q in norm(a['constructeur']) or q in norm(a['ancien']) or q in norm(a['emplacement']): score = 4
+        elif q in norm(a['qr']): score = 5
+        else: continue
+        a['_score'] = score; a['_row'] = DATA_ROW+idx
+        found.append(a)
+    found.sort(key=lambda a:(a['_score'], norm(a['code'])))
+    # Avoid showing duplicate code copies multiple times; retain first exact match.
+    unique=[]; seen=set()
+    for a in found:
+        if a['code'] in seen: continue
+        seen.add(a['code']); unique.append(a)
+        if len(unique)>=limit: break
+    return unique
+
+
+def search_articles(query, limit=15):
+    if not norm(query): return []
+    with ExcelSession() as xl:
+        _, values = read_stock_values(xl.wb)
+    return match_articles(values, query, limit)
+
+
+def format_article(a, role):
+    # Titles (labels) in bold, values in normal weight. Telegram cannot colour text, so the lines that must
+    # stand out (Écart, Alerte/Rupture, Achat) carry a red 🔴 marker in front of their bold title.
+    def line(label, value, red=False):
+        return f"{'🔴 ' if red else ''}<b>{esc(label)} :</b> {esc(value)}"
+    lines = [f"<b>{esc(a['code'])} — {esc(a['designation'])}</b>"]
+    # Maintenance receives strictly limited technical fields; no stock, price, min/max,
+    # discrepancy, manufacturer, old number or line information is disclosed.
+    nd = 'Non défini'
+    if role in ('admin','responsable','magasinier'):
+        lines.append(line('Ligne', a['ligne'] or nd))
+    lines.append(line('Machine', a['machine'] or nd))
+    lines.append(line('Emplacement', a['emplacement'] or nd))
+    if role in ('admin','responsable','magasinier') and a['constructeur']:
+        lines.append(line('Constructeur', a['constructeur']))
+    if role in ('admin','responsable','magasinier') and a['ancien']:
+        lines.append(line('Ancien N°', a['ancien']))
+    if role in ('admin','responsable'):
+        lines += [line('Stock disponible', as_text(a['stock'])), line('Stock min/max', f"{as_text(a['min'])} / {as_text(a['max'])}"),
+                  line('Prix unitaire', f"{as_text(a['prix'])} DA"), line('Valeur stock', f"{as_text(a['valeur'])} DA"),
+                  line('Écart SAP', as_text(a['ecart']), red=True)]
+        if a['alerte']:
+            # the sheet value already starts with its own emoji (✅ OK / 🔴 RUPTURE / 🟡 CRITIQUE): keep only the word
+            lines.append(line('Alerte', re.sub(r'^[^\w]+', '', as_text(a['alerte'])), red=True))
+        if a['conso30'] not in (None,''): lines.append(line('Consommation 30 j', as_text(a['conso30'])))
+        if a['jours'] not in (None,''): lines.append(line('Jours restants estimés', as_text(a['jours'])))
+        if a['abc']: lines.append(line('Classe ABC', a['abc']))
+    return '\n'.join(lines)
+
+
+def _blank(v): return v is None or (isinstance(v, str) and not v.strip())
+
+def next_movement_row(sh):
+    # First row (5..3004) whose input cells B (date), C (code) and G (quantity) are all empty.
+    # Formula columns D/E/F/L/M/N are ignored; menu row 3007 is never used as data.
+    vals = com_retry(lambda: sh.Range(f'B{DATA_ROW}:G{MOVE_LAST_ROW}').Value)   # columns B..G
+    for i, row in enumerate(vals or []):
+        if _blank(row[0]) and _blank(row[1]) and _blank(row[5]): return DATA_ROW + i
+    raise RuntimeError('Feuille de mouvements pleine (limite sûre avant la ligne de menu). Aucun changement effectué.')
+
+def get_article_by_code(code):
+    res = search_articles(code, 10)
+    for a in res:
+        if norm(a['code']) == norm(code): return a
+    return None
+
+def _code_for_cell(a):
+    # Write the code with the same type as in STOCK (number stays a number) — formulas use TEXT(C,"0").
+    raw = a.get('code_raw')
+    if isinstance(raw, float) and raw.is_integer(): return int(raw)
+    if isinstance(raw, (int, str)): return raw
+    return a['code']
+
+def append_movement(kind, code, qty, bon='', sap='', observation='', user=None):
+    role = role_of(user.get('id')) if user else None
+    if not can_move(role): raise PermissionError('Votre rôle ne permet pas de saisir des mouvements.')
+    code = str(code).strip(); qty = as_num(qty)
+    if not code or qty <= 0: raise ValueError('Le code article et une quantité strictement positive sont obligatoires.')
+    sheet_name = SHEET_ENTRIES if kind == 'ENTRÉE' else SHEET_EXITS
+    written = []   # cells written so far (rolled back if the operation fails before the save completes)
+    sh = None
+    with ExcelSession() as xl:
+        wb = xl.wb
+        try:
+            try: com_retry(xl.app.Calculate)
+            except ExcelBusyError: raise
+            except Exception: pass
+            sh_stock, values = read_stock_values(wb)
+            a = None
+            for cand in match_articles(values, code, 10):
+                if norm(cand['code']) == norm(code): a = cand; break
+            if not a: raise ValueError(f'{NOT_FOUND} Code article introuvable : {code}')
+            if kind == 'SORTIE' and as_num(a['stock']) < qty:
+                raise ValueError(f"Stock insuffisant. Disponible dans le classeur : {as_text(a['stock'])}; demandé : {qty:g}.")
+            if com_retry(lambda: wb.ReadOnly):
+                raise RuntimeError('Le classeur est ouvert en lecture seule (probablement déjà ouvert ailleurs). Le bot n’a rien écrit.')
+            sh = find_sheet(wb, sheet_name)
+            row = next_movement_row(sh)
+            # Column A = category: STOCK!L only counts rows where A = "PDR" (this bot manages the PDR STOCK sheet).
+            # Columns B,C,G..K are inputs. D/E/F (lookups) and L/M/N (formulas) are never written.
+            vals = {'A':MOVE_CATEGORY, 'B':datetime.now(), 'C':_code_for_cell(a), 'G':qty, 'H':bon, 'I':sap, 'J':display_name(user or {}), 'K':observation}
+            # Protected sheet (SORTIES): the bot never unprotects it. It writes only if the input cells are unlocked.
+            if com_retry(lambda: bool(sh.ProtectContents)):
+                for col in vals:
+                    if com_retry(lambda col=col: bool(sh.Range(f'{col}{row}').Locked)):
+                        raise RuntimeError(f'La feuille {sheet_name} est protégée et la cellule {col}{row} est verrouillée. Le bot n’a rien écrit.')
+            for col, value in vals.items():
+                com_retry(lambda col=col, value=value: setattr(sh.Range(f'{col}{row}'), 'Value', value))
+                written.append(col)
+            try:   # keep the sheet's own date format; only fix a cell that is still "General"
+                if str(com_retry(lambda: sh.Range(f'B{row}').NumberFormat)).lower() == 'general':
+                    com_retry(lambda: setattr(sh.Range(f'B{row}'), 'NumberFormat', 'dd/mm/yyyy'))
+            except ExcelBusyError: raise
+            except Exception: pass
+            com_retry(wb.Save)
+            written = []   # saved: nothing to roll back
+            try: com_retry(xl.app.Calculate)
+            except Exception: pass
+            try: after = com_retry(lambda: sh_stock.Cells(a['_row'], 12).Value)
+            except Exception: after = None
+        except Exception:
+            if written and sh is not None:   # best-effort rollback of the input cells this call wrote
+                for col in written:
+                    try: com_retry(lambda col=col: sh.Range(f'{col}{row}').ClearContents())
+                    except Exception: pass
+            raise
+    log_event('movement', user_id=user.get('id') if user else None, user_name=display_name(user or {}), role=role, kind=kind, code=code, qty=qty, bon=bon, observation=observation, sheet=sheet_name, row=row, stock_after=as_text(after))
+    return row, a, after
+
+# Image/QR helpers
+def get_file_bytes(file_id):
+    info = api('getFile', {'file_id':file_id})
+    path = info.get('file_path')
+    if not path: raise RuntimeError('Telegram n’a pas retourné le chemin de la photo.')
+    url = f'https://api.telegram.org/file/bot{TOKEN}/{path}'
+    with urllib.request.urlopen(url, timeout=40) as r: return r.read()
+
+def decode_qr(data):
+    if cv2 is None or np is None: return ''
+    try:
+        arr = np.frombuffer(data, dtype=np.uint8); img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None: return ''
+        detector = cv2.QRCodeDetector(); val, points, _ = detector.detectAndDecode(img)
+        return (val or '').strip()
+    except Exception: return ''
+
+def parse_code_from_qr(text):
+    text = (text or '').strip()
+    # Our workbook QR text begins with code; otherwise accept common key=value patterns.
+    m = re.search(r'(?:CODE(?:\s*ARTICLE)?|ARTICLE)\s*[:=]\s*([A-Za-z0-9._/-]+)', text, re.I)
+    if m: return m.group(1)
+    return re.split(r'[|;\n,\t ]', text, maxsplit=1)[0].strip()
+
+def phash(data):
+    if Image is None: return None
+    try:
+        im = Image.open(io.BytesIO(data)).convert('L').resize((8,8))
+        px = list(im.getdata()); avg = sum(px)/len(px)
+        bits = ''.join('1' if p >= avg else '0' for p in px)
+        return int(bits,2)
+    except Exception: return None
+
+def image_distance(h1,h2): return (h1 ^ h2).bit_count() if h1 is not None and h2 is not None else 65
+
+def image_search(data, limit=IMAGE_SEARCH_LIMIT):
+    """Closest photos of the IMAGES folder, as [(code, distance)] sorted from the closest (distance 0..64).
+    Always returns up to `limit` photos when the folder has them; the caller decides how to word weak matches."""
+    h = phash(data)
+    if h is None: return []
+    best={}
+    for p in IMAGES_DIR.iterdir():
+        if not p.is_file() or p.suffix.lower() not in ('.jpg','.jpeg','.png','.webp','.bmp'): continue
+        try:
+            dist=image_distance(h,phash(p.read_bytes()))
+            code=p.stem.split('_',1)[0] if p.stem.split('_',1)[0] else p.stem   # CODE_2.jpg -> CODE
+            if code not in best or dist<best[code]: best[code]=dist
+        except Exception: pass
+    return sorted(best.items(), key=lambda kv:(kv[1], kv[0]))[:limit]
+
+def photo_file_from_message(message):
+    photos = message.get('photo') or []
+    if not photos: return None
+    return max(photos, key=lambda p:p.get('file_size',0)).get('file_id')
+
+def pending_metadata_path(pid): return PENDING_DIR / f'{pid}.json'
+
+def submit_pending_photo(code, data, user, caption=''):
+    code = str(code).strip()
+    if not get_article_by_code(code): raise ValueError(f'{NOT_FOUND} Code article introuvable : {code}')
+    pid = datetime.now().strftime('%Y%m%d%H%M%S') + '_' + str(user.get('id')) + '_' + hashlib.sha1(os.urandom(16)).hexdigest()[:6]
+    # Keep image extension conservative; normalize image to JPEG when Pillow is available.
+    ext='.jpg'
+    if Image is not None:
+        try:
+            im=Image.open(io.BytesIO(data))
+            if ImageOps is not None:
+                try: im=ImageOps.exif_transpose(im)          # phone photos: keep the right way up before resizing
+                except Exception: pass
+            im=im.convert('RGB')
+            if max(im.size) > PHOTO_MAX_SIDE:                 # shrink only if larger; never enlarge
+                im.thumbnail((PHOTO_MAX_SIDE, PHOTO_MAX_SIDE), getattr(Image, 'Resampling', Image).LANCZOS)
+            out=io.BytesIO(); im.save(out,format='JPEG',quality=PHOTO_JPEG_QUALITY,optimize=True); data=out.getvalue()
+        except Exception: pass
+    img_path=PENDING_DIR/f'{pid}{ext}'; img_path.write_bytes(data)
+    meta={'id':pid,'code':code,'sender_id':user.get('id'),'sender_name':display_name(user),'created_at':datetime.now().isoformat(timespec='seconds'),'caption':caption,'file':img_path.name,'status':'pending'}
+    pending_metadata_path(pid).write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+    log_event('photo_pending', pending_id=pid, code=code, user_id=user.get('id'), user_name=display_name(user))
+    return pid
+
+def list_pending():
+    out=[]
+    for p in PENDING_DIR.glob('*.json'):
+        try:
+            m=json.loads(p.read_text(encoding='utf-8'))
+            if m.get('status')=='pending' and (PENDING_DIR/m.get('file','')).exists(): out.append(m)
+        except Exception: pass
+    return sorted(out,key=lambda x:x.get('created_at',''))
+
+def resolve_photo(pid, approve, reviewer, auto=False):
+    mp=pending_metadata_path(pid)
+    if not mp.exists(): raise ValueError('Demande photo introuvable ou déjà traitée.')
+    meta=json.loads(mp.read_text(encoding='utf-8')); src=PENDING_DIR/meta['file']
+    if meta.get('status')!='pending' or not src.exists(): raise ValueError('Cette photo a déjà été traitée.')
+    code=meta['code']
+    if approve:
+        dest=IMAGES_DIR/f'{code}.jpg'
+        # Backup previous approved image before replacement; never delete it without a backup.
+        for old in IMAGES_DIR.glob(code+'.*'):
+            if old.is_file():
+                backup=BACKUP_DIR/f'{code}_{datetime.now().strftime("%Y%m%d_%H%M%S")}{old.suffix.lower()}'
+                shutil.copy2(old,backup)
+                if old != dest: old.unlink()
+        shutil.move(str(src),str(dest))
+        meta['status']='approved'; meta['reviewer_id']=reviewer.get('id'); meta['reviewer_name']=display_name(reviewer); meta['reviewed_at']=datetime.now().isoformat(timespec='seconds'); meta['approved_file']=dest.name
+        meta['auto_approved']=bool(auto)
+        log_event('photo_auto_approved' if auto else 'photo_approved', pending_id=pid, code=code, reviewer_id=reviewer.get('id'), user_name=display_name(reviewer))
+    else:
+        dest=REJECTED_DIR/src.name
+        shutil.move(str(src),str(dest))
+        meta['status']='rejected'; meta['reviewer_id']=reviewer.get('id'); meta['reviewer_name']=display_name(reviewer); meta['reviewed_at']=datetime.now().isoformat(timespec='seconds'); meta['rejected_file']=dest.name
+        log_event('photo_rejected', pending_id=pid, code=code, reviewer_id=reviewer.get('id'))
+    mp.write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+    return meta
+
+def submit_photo_flow(chat_id, uid, user, role, code, data, caption=''):
+    """Queue the photo; if the sender is allowed to publish without approval, install it right away."""
+    try:
+        pid=submit_pending_photo(code,data,user,caption)
+        direct=is_photo_direct(uid, role)
+        if direct: resolve_photo(pid, True, user, auto=True)
+        clear_state(uid)
+    except Exception as e:
+        send(chat_id,f'Photo non enregistrée : {esc(e)}'); return False
+    if direct:
+        send(chat_id,f"✅ Photo enregistrée directement (sans validation).\nCode : <code>{esc(code)}</code>\nRéférence : <code>{esc(pid)}</code>\nL’ancienne photo est conservée dans IMAGES_BACKUP.",main_keyboard(role))
+        return True
+    send(chat_id,f"✅ Photo mise en attente de validation.\nCode : <code>{esc(code)}</code>\nRéférence : <code>{esc(pid)}</code>\nLa photo validée actuelle n’a pas été remplacée.")
+    for tid,r in load_users().items():
+        if r in ('admin','responsable') and str(tid)!=str(uid):
+            try: send(int(tid),f"Nouvelle photo à valider — code {esc(code)} — ID {esc(pid)}")
+            except Exception: pass
+    return True
+
+def fmt_dt(iso):
+    try: return datetime.fromisoformat(iso).strftime('%d/%m/%Y %H:%M')
+    except Exception: return str(iso or '')
+
+def photo_records():
+    out=[]
+    for p in PENDING_DIR.glob('*.json'):
+        try: m=json.loads(p.read_text(encoding='utf-8'))
+        except Exception: continue
+        if m.get('id') and m.get('sender_id') is not None: out.append(m)
+    return out
+
+def photo_stats():
+    stats={}
+    for m in photo_records():
+        sid=str(m['sender_id'])
+        s=stats.setdefault(sid,{'name':USER_NAMES.get(sid) or m.get('sender_name') or sid,'approved':0,'auto':0,'pending':0,'rejected':0,'last':''})
+        st=m.get('status')
+        if st=='approved':
+            s['approved']+=1
+            if m.get('auto_approved'): s['auto']+=1
+        elif st=='pending': s['pending']+=1
+        elif st=='rejected': s['rejected']+=1
+        s['last']=max(s['last'], m.get('created_at',''))
+    return stats
+
+def photo_tracking(chat_id):
+    stats=photo_stats()
+    if not stats: return send(chat_id,'📊 Aucune photo envoyée par les utilisateurs pour le moment.')
+    total=sum(s['approved']+s['pending']+s['rejected'] for s in stats.values())
+    lines=[f'📊 <b>Suivi des photos — {total} photo(s) au total</b>']
+    rows=[]
+    for sid,s in sorted(stats.items(), key=lambda kv: kv[1]['last'], reverse=True):
+        direct=f" (dont {s['auto']} directe(s))" if s['auto'] else ''
+        lines.append(f"• <b>{esc(s['name'])}</b> — ✅ {s['approved']}{direct} · ⏳ {s['pending']} · ❌ {s['rejected']} · dernière : {fmt_dt(s['last'])}")
+        rows.append([btn(f"📂 {s['name']}"[:60], f'um:ph:{sid}')])
+    lines.append('\nTouchez un nom pour voir le détail de ses dernières photos.')
+    send(chat_id,'\n'.join(lines),inline(rows[:30]))
+
+def photo_user_detail(chat_id, sid):
+    recs=sorted([m for m in photo_records() if str(m['sender_id'])==str(sid)], key=lambda m:m.get('created_at',''), reverse=True)
+    if not recs: return send(chat_id,'Aucune photo pour cet utilisateur.')
+    name=USER_NAMES.get(str(sid)) or recs[0].get('sender_name') or sid
+    lab={'approved':'✅ validée','pending':'⏳ en attente','rejected':'❌ rejetée'}
+    lines=[f'📂 <b>Photos de {esc(name)}</b> (15 dernières sur {len(recs)})']
+    for m in recs[:15]:
+        how=' · directe' if m.get('auto_approved') else (f" · par {esc(m.get('reviewer_name'))}" if m.get('reviewer_name') else '')
+        lines.append(f"• {fmt_dt(m.get('created_at'))} — <code>{esc(m.get('code'))}</code> — {lab.get(m.get('status'),esc(m.get('status')))}{how}")
+    send(chat_id,'\n'.join(lines))
+
+def recent_operations(limit=15):
+    ops=[]
+    try:
+        with AUDIT_FILE.open(encoding='utf-8') as f:
+            for ln in f:
+                try: r=json.loads(ln)
+                except Exception: continue
+                if r.get('event')=='movement': ops.append(r)
+    except Exception: return []
+    return ops[-limit:][::-1]
+
+def send_operations(chat_id, limit=15):
+    ops=recent_operations(limit)
+    if not ops: return send(chat_id,'🕘 Aucune opération enregistrée par le bot pour le moment.')
+    lines=[f'🕘 <b>{len(ops)} dernière(s) opération(s)</b>']
+    for r in ops:
+        icon='📥' if r.get('kind')=='ENTRÉE' else '📤'
+        obs=f" — {esc(r.get('observation'))}" if r.get('observation') else ''
+        lines.append(f"• {fmt_dt(r.get('time'))} {icon} {esc(r.get('kind'))} · <code>{esc(r.get('code'))}</code> · {esc(as_text(r.get('qty')))} · <b>{esc(r.get('user_name'))}</b>{obs}")
+    send(chat_id,'\n'.join(lines))
+
+def send_article_photo(chat_id, code):
+    candidates=[]
+    for ext in ('.jpg','.jpeg','.png','.webp','.bmp'):
+        p=IMAGES_DIR/f'{code}{ext}'
+        if p.exists(): candidates.append(p)
+    if not candidates:
+        send(chat_id, f"Aucune photo validée enregistrée pour le code <code>{esc(code)}</code>.")
+        return
+    p=candidates[0]
+    try: api('sendPhoto', {'chat_id':chat_id,'caption':f'Photo validée — {code}'}, {'photo':(p.name,p.read_bytes(),'image/jpeg' if p.suffix.lower() in ('.jpg','.jpeg') else 'image/png')})
+    except Exception as e: send(chat_id, f'Photo trouvée mais envoi impossible : {esc(e)}')
+
+# Conversation states, in-memory only; sensitive pending image content is always stored separately.
+STATE={}
+def set_state(uid, value): STATE[str(uid)]=value
+def get_state(uid): return STATE.get(str(uid))
+def clear_state(uid): STATE.pop(str(uid),None)
+
+def find_article_photo(code):
+    for ext in ('.jpg','.jpeg','.png','.webp','.bmp'):
+        p=IMAGES_DIR/f'{code}{ext}'
+        try:
+            if p.exists() and p.stat().st_size>0: return p
+        except Exception: pass
+    try:   # older naming CODE_1.jpg, CODE_2.png ...
+        for p in sorted(IMAGES_DIR.glob(f'{code}_*')):
+            if p.is_file() and p.suffix.lower() in ('.jpg','.jpeg','.png','.webp','.bmp') and p.stat().st_size>0: return p
+    except Exception: pass
+    return None
+
+def articles_by_codes(codes):
+    """{norm(code): article} for the given codes, from ONE read of STOCK (used to label photo-search results)."""
+    wanted={norm(c) for c in codes}; found={}
+    try:
+        with ExcelSession() as xl:
+            _, values = read_stock_values(xl.wb)
+        for idx,row in enumerate(values or []):
+            if not row: continue
+            c=norm(as_text(row[0]))
+            if c in wanted and c not in found:
+                a=article_from_row(row); a['_row']=DATA_ROW+idx; found[c]=a
+    except Exception as e:
+        log_event('articles_by_codes_failed', error=repr(e))
+    return found
+
+def article_label(a):
+    return f"{a['code']} — {a['designation'][:40]}"
+
+def send_article_details(chat_id, role, a):
+    """Article card (according to role) + validated photo; photo and card in one message when possible."""
+    code=a['code']; card=format_article(a, role); p=find_article_photo(code); done=False
+    if p and len(card)<=1000:
+        mime='image/jpeg' if p.suffix.lower() in ('.jpg','.jpeg') else 'image/png'
+        try:
+            api('sendPhoto', {'chat_id':chat_id,'caption':card,'parse_mode':'HTML'}, {'photo':(p.name,p.read_bytes(),mime)}); done=True
+        except Exception: done=False
+    if not done:
+        send(chat_id, card + ('' if p else '\n\n📷 <i>Aucune photo validée enregistrée pour cet article.</i>'), main_keyboard(role))
+        if p: send_article_photo(chat_id, code)
+    if can_move(role):
+        send(chat_id,'Choisissez une opération pour cet article :',inline([[btn('📥 Entrée',f'move:ENTRÉE:{code}'),btn('📤 Sortie',f'move:SORTIE:{code}')]]))
+
+def show_search_results(chat_id, role, query):
+    articles=search_articles(query,SEARCH_LIMIT)
+    if not articles:
+        send(chat_id,f'{NOT_FOUND} <b>Code ou article introuvable</b> : <code>{esc(query)}</code>\nVérifiez le code (complet ou partiel) ou essayez un mot de la désignation.')
+        return
+    # Exact code, or a single result: show the article card + photo directly (no extra click).
+    exact=[a for a in articles if norm(a['code'])==norm(query)]
+    if exact or len(articles)==1:
+        return send_article_details(chat_id, role, (exact or articles)[0])
+    # Several results: one line per article (code — name); touching a line shows photo (if any) + card by role.
+    rows=[[btn(article_label(a), f"article:{a['code']}")] for a in articles]
+    suffix=f' (maximum {SEARCH_LIMIT} — précisez la recherche pour affiner)' if len(articles)>=SEARCH_LIMIT else ''
+    send(chat_id, f'🔎 <b>{len(articles)} résultat(s)</b>{suffix}\nTouchez une ligne pour voir la photo et les informations :', inline(rows))
+
+def finish_movement(chat_id, uid, user, role, state, obs):
+    state['obs']=obs
+    try:
+        # N° SAP is deliberately left empty: it is typed by hand later in Excel. Operator name goes to column J.
+        row,a,after=append_movement(state['kind'],state['code'],state['qty'],state.get('bon',''),'',obs,user)
+        clear_state(uid)
+        after_line=f"\nDisponible après opération : <b>{esc(as_text(after))}</b>" if after not in (None,'') else ''
+        obs_line=f"\nObservation : {esc(obs)}" if obs else ''
+        return send(chat_id,f"✅ Mouvement enregistré dans Excel.\nType : {state['kind']}\nCode : {esc(a['code'])}\nQuantité : {state['qty']:g}\nN° Bon : {esc(state.get('bon') or '—')}{obs_line}\nOpérateur : {esc(display_name(user))}\nLigne Excel : {row}{after_line}\nN° SAP : à saisir manuellement dans Excel.",main_keyboard(role))
+    except Exception as e: return send(chat_id,f'❌ Mouvement non enregistré : {esc(e)}\nAucune modification de structure ou de formule n’a été effectuée.')
+
+def begin_movement(chat_id, uid, kind):
+    role=role_of(uid)
+    if not can_move(role): return send(chat_id,'⛔ Votre rôle ne permet pas les entrées/sorties.')
+    set_state(uid, {'step':'move_code','kind':kind})
+    send(chat_id, f"Saisissez ou envoyez le code article pour l’opération <b>{kind}</b>.")
+
+def begin_photo(chat_id, uid):
+    role=role_of(uid)
+    if not can_submit_photo(role): return send(chat_id,'⛔ Votre rôle ne permet pas de proposer une photo.')
+    set_state(uid, {'step':'photo_wait'})
+    send(chat_id,'Envoyez la photo de la pièce. Vous pouvez écrire le code article dans la légende. Si le code est détecté dans un QR, il sera proposé automatiquement. La photo ne remplacera pas la photo validée avant approbation.')
+
+def pending_menu(chat_id):
+    items=list_pending()
+    if not items: return send(chat_id,'Aucune photo en attente.')
+    for m in items[:20]:
+        row=[[btn('✅ Approuver',f"photo_ok:{m['id']}"),btn('❌ Rejeter',f"photo_no:{m['id']}")]]
+        send(chat_id,f"Photo en attente\nCode : <code>{esc(m['code'])}</code>\nEnvoyée par : {esc(m.get('sender_name'))}\nDate : {esc(m.get('created_at'))}",inline(row))
+        p=PENDING_DIR/m['file']
+        try: api('sendPhoto', {'chat_id':chat_id,'caption':f"En attente — {m['code']} — ID {m['id']}"}, {'photo':(p.name,p.read_bytes(),'image/jpeg')})
+        except Exception: pass
+
+# ---------------------------------------------------------------------------------------
+# 📅 Rapport mensuel  +  🛒 Alertes achat  (lecture seule : rien n'est écrit dans Excel)
+# Le rapport est calculé à partir des feuilles ENTRÉES / SORTIES (mois choisi) et de la feuille STOCK,
+# car la feuille « RAPPORT MENSUEL » du classeur contient des valeurs fixes (non mises à jour).
+# Alertes achat = articles avec un Stock Min défini (> 0) : Rupture (stock 0) ou Critique (stock <= min).
+# Quantité à acheter = Stock Max − Stock actuel (même règle que la colonne QTT ACHAT de la feuille STOCK BAS).
+# ---------------------------------------------------------------------------------------
+MONTHS_FR=['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre']
+ACHAT_PAGE=15
+ACHAT_CACHE_SECONDS=600
+_ACHAT_CACHE={'t':0.0,'data':None}
+
+def _num(v):
+    n=as_num(v)
+    return 0.0 if n<=-2146826000 else n      # codes d'erreur Excel (#N/A, #REF!...) renvoyés par COM
+
+def _as_date(v):
+    if v is None or v=='': return None
+    if hasattr(v,'year') and hasattr(v,'month'): return v
+    if isinstance(v,(int,float)) and 30000<v<80000: return datetime(1899,12,30)+timedelta(days=float(v))
+    if isinstance(v,str):
+        for fmt in ('%d/%m/%Y','%Y-%m-%d','%d-%m-%Y','%d/%m/%y'):
+            try: return datetime.strptime(v.strip(),fmt)
+            except ValueError: pass
+    return None
+
+def fmt_da(x): return f'{x:,.0f}'.replace(',',' ')+' DA'
+def fmt_q(x): return f'{x:,.2f}'.rstrip('0').rstrip('.').replace(',',' ')
+
+def month_movements(values, year, month):
+    out=[]
+    for row in values or []:
+        if not row or len(row)<7: continue
+        d=_as_date(row[1])
+        if d is None or d.year!=year or d.month!=month or _blank(row[2]): continue
+        out.append({'cat':as_text(row[0]) or 'PDR','code':as_text(row[2]),'designation':as_text(row[3]),
+                    'qty':_num(row[6]),'bon':as_text(row[7]) if len(row)>7 else '','val':_num(row[13]) if len(row)>13 else 0.0})
+    return out
+
+def compute_purchase_alerts(values):
+    seen=set(); rup=[]; crit=[]; near=[]; nothreshold=0; n_art=0; total_val=0.0
+    for row in values or []:
+        if not row: continue
+        a=article_from_row(row)
+        if not a['code'] or a['code'] in seen: continue
+        seen.add(a['code']); n_art+=1; total_val+=_num(a['valeur'])
+        mn=_num(a['min']); st=_num(a['stock']); mx=_num(a['max'])
+        if mn<=0:
+            if st<=0: nothreshold+=1
+            continue
+        item={'code':a['code'],'designation':a['designation'],'stock':st,'min':mn,'max':mx,'buy':(max(0.0,mx-st) if mx>0 else None)}
+        if st<=0: rup.append(item)
+        elif st<=mn: crit.append(item)
+        elif st<mn*1.2: near.append(item)
+    rup.sort(key=lambda i:norm(i['designation']))
+    crit.sort(key=lambda i:(i['stock']/i['min'],norm(i['designation'])))
+    near.sort(key=lambda i:(i['stock']/i['min'],norm(i['designation'])))
+    return {'rup':rup,'crit':crit,'near':near,'att':len(near),'nothreshold':nothreshold,'articles':n_art,'valeur':total_val}
+
+def get_purchase_data(force=False):
+    if not force and _ACHAT_CACHE['data'] and time.time()-_ACHAT_CACHE['t']<ACHAT_CACHE_SECONDS: return _ACHAT_CACHE['data']
+    with ExcelSession() as xl:
+        _, values = read_stock_values(xl.wb)
+    data=compute_purchase_alerts(values)
+    _ACHAT_CACHE['t']=time.time(); _ACHAT_CACHE['data']=data
+    return data
+
+def _by_cat(moves):
+    d={}
+    for m in moves:
+        c=d.setdefault(m['cat'],{'n':0,'val':0.0}); c['n']+=1; c['val']+=m['val']
+    return d
+
+def format_month_report(year, month, ins, outs, stock):
+    L=[f'📅 <b>Rapport mensuel — {MONTHS_FR[month-1]} {year}</b>','']
+    def block(icon, title, moves):
+        if not moves: return [f'{icon} <b>{title}</b> : aucun mouvement ce mois']
+        lines=[f"{icon} <b>{title}</b> : {len(moves)} mouvement(s) · quantité {fmt_q(sum(m['qty'] for m in moves))} · {fmt_da(sum(m['val'] for m in moves))}"]
+        cats=_by_cat(moves)
+        if len(cats)>1:
+            for c,x in sorted(cats.items()): lines.append(f"    • {esc(c)} : {x['n']} mvt · {fmt_da(x['val'])}")
+        return lines
+    L+=block('📥','Entrées',ins)
+    L+=block('📤','Sorties',outs)
+    solde=sum(m['val'] for m in ins)-sum(m['val'] for m in outs)
+    L.append(f'💰 <b>Solde (entrées − sorties)</b> : {fmt_da(solde)}')
+    if outs:
+        top={}
+        for m in outs:
+            t=top.setdefault(m['code'],[m['designation'],0.0]); t[1]+=m['qty']
+        L+=['','🔝 <b>Articles les plus sortis</b> (quantité) :']
+        for i,(code,(des,q)) in enumerate(sorted(top.items(), key=lambda kv:-kv[1][1])[:5],1):
+            L.append(f'{i}. <code>{esc(code)}</code> {esc(des[:45])} : <b>{fmt_q(q)}</b>')
+        nobon=sum(1 for m in outs if not m['bon'])
+        if nobon: L.append(f'⚠️ Sorties sans N° Bon : <b>{nobon}</b>')
+    nb=len(stock['rup'])+len(stock['crit'])
+    L+=['','📦 <b>État du stock PDR (actuel)</b>',
+        f"Articles : {stock['articles']} · Valeur : {fmt_da(stock['valeur'])}",
+        f"🔴 Ruptures : <b>{len(stock['rup'])}</b> · 🟡 Critiques : <b>{len(stock['crit'])}</b> · 🟠 Attention : <b>{stock['att']}</b>",
+        f'🛒 À acheter : <b>{nb}</b> article(s) — bouton « 🛒 Alertes achat ».']
+    return '\n'.join(L)
+
+REPORT_CACHE_SECONDS=300
+_REPORT_CACHE={'t':0.0,'data':None}
+MONTHS_SHORT=['Jan','Fév','Mar','Avr','Mai','Juin','Juil','Août','Sep','Oct','Nov','Déc']
+
+def edit(chat_id, message_id, text, keyboard=None):
+    if len(text)>3900: text=text[:3850]+'\n… (résultat raccourci)'
+    payload={'chat_id':chat_id,'message_id':message_id,'text':text,'parse_mode':'HTML','disable_web_page_preview':True}
+    if keyboard: payload['reply_markup']=keyboard
+    return api('editMessageText', payload)
+
+def edit_or_send(chat_id, message_id, text, keyboard=None):
+    """Modifie le message existant (pas de nouveau message à chaque clic) ; sinon envoie un nouveau message."""
+    if message_id:
+        try: return edit(chat_id, message_id, text, keyboard)
+        except Exception as e:
+            if 'not modified' in str(e): return None
+    return send(chat_id, text, keyboard)
+
+def build_month_report(year, month, force=False):
+    c=_REPORT_CACHE
+    if force or not c['data'] or time.time()-c['t']>REPORT_CACHE_SECONDS:
+        with ExcelSession() as xl:
+            wb=xl.wb
+            sh_in=find_sheet(wb,SHEET_ENTRIES); sh_out=find_sheet(wb,SHEET_EXITS)
+            v_in=com_retry(lambda: sh_in.Range(f'A{DATA_ROW}:N{MOVE_LAST_ROW}').Value)
+            v_out=com_retry(lambda: sh_out.Range(f'A{DATA_ROW}:N{MOVE_LAST_ROW}').Value)
+            _, v_stock = read_stock_values(wb)
+        stock=compute_purchase_alerts(v_stock)
+        c['data']=(v_in,v_out,stock); c['t']=time.time()
+        _ACHAT_CACHE['t']=c['t']; _ACHAT_CACHE['data']=stock
+    v_in,v_out,stock=c['data']
+    return format_month_report(year, month, month_movements(v_in,year,month), month_movements(v_out,year,month), stock)
+
+def month_nav(year, month):
+    py,pm=(year-1,12) if month==1 else (year,month-1)
+    ny,nm=(year+1,1) if month==12 else (year,month+1)
+    row=[btn('◀ '+MONTHS_FR[pm-1],f'rm:{py}-{pm:02d}')]
+    now=datetime.now()
+    if (ny,nm)<=(now.year,now.month): row.append(btn(MONTHS_FR[nm-1]+' ▶',f'rm:{ny}-{nm:02d}'))
+    return inline([row,[btn('📆 Choisir le mois',f'rmp:{year}')]])
+
+def month_picker(year):
+    rows=[[btn(MONTHS_SHORT[r*3+c], f'rm:{year}-{r*3+c+1:02d}') for c in range(3)] for r in range(4)]
+    nav=[btn(f'◀ {year-1}',f'rmp:{year-1}')]
+    if year<datetime.now().year: nav.append(btn(f'{year+1} ▶',f'rmp:{year+1}'))
+    rows.append(nav)
+    return inline(rows)
+
+def show_month_report(chat_id, role, year=None, month=None, message_id=None):
+    if not can_see_full(role): return send(chat_id,'⛔ Accès réservé à Responsable/Admin.')
+    now=datetime.now(); year=year or now.year; month=month or now.month
+    mid=message_id
+    if mid is None:
+        try: mid=(send(chat_id,'⏳ Calcul du rapport en cours…') or {}).get('message_id')
+        except Exception: mid=None
+    try: text=build_month_report(year, month, force=message_id is None)
+    except Exception as e: return edit_or_send(chat_id, mid, f'❌ Rapport impossible : {esc(e)}')
+    return edit_or_send(chat_id, mid, text, month_nav(year,month))
+
+def achat_item_text(i):
+    icon='🔴' if i['stock']<=0 else '🟡' if i['stock']<=i['min'] else '🟠'
+    label='Acheter' if i['stock']<=i['min'] else 'Pour atteindre le max'
+    buy=f"{label} <b>{fmt_q(i['buy'])}</b>" if i['buy'] is not None else 'Max non défini'
+    return f"{icon} <code>{esc(i['code'])}</code> {esc(i['designation'][:45])}\n    Stock <b>{fmt_q(i['stock'])}</b> · Min {fmt_q(i['min'])} · Max {fmt_q(i['max'])} → {buy}"
+
+def build_achat_summary(d):
+    nr,nc,nn=len(d['rup']),len(d['crit']),len(d['near'])
+    txt=(f"🛒 <b>Alertes d’achat — PDR</b>\n\n🔴 Ruptures (stock 0) : <b>{nr}</b>\n🟡 Critiques (stock ≤ min) : <b>{nc}</b>\n"
+         f"➡️ <b>Total à acheter : {nr+nc}</b>\n🟠 Proches du minimum : {nn}\n\n"
+         f"ℹ️ Seuls les articles ayant un Stock Min défini sont comptés ({d['nothreshold']} article(s) à stock 0 sans Stock Min sont exclus).\n"
+         f"Quantité à acheter = Stock Max − Stock actuel.")
+    rows=[[btn(f'🔴 Ruptures ({nr})','ach:R:0'),btn(f'🟡 Critiques ({nc})','ach:C:0')],[btn(f'🟠 Proches du minimum ({nn})','ach:N:0')]]
+    return txt, inline(rows)
+
+def show_achat_summary(chat_id, role):
+    if not can_see_full(role): return send(chat_id,'⛔ Accès réservé à Responsable/Admin.')
+    try: mid=(send(chat_id,'⏳ Lecture du stock en cours…') or {}).get('message_id')
+    except Exception: mid=None
+    try: d=get_purchase_data(force=True)
+    except Exception as e: return edit_or_send(chat_id, mid, f'❌ Lecture impossible : {esc(e)}')
+    txt,kb=build_achat_summary(d)
+    return edit_or_send(chat_id, mid, txt, kb)
+
+def show_achat_page(chat_id, role, kind, page, message_id=None):
+    if not can_see_full(role): return send(chat_id,'⛔ Accès réservé à Responsable/Admin.')
+    out=lambda text,kb=None: edit_or_send(chat_id, message_id, text, kb)
+    back=[btn('↩ Retour au résumé','ach:S:0')]
+    try: d=get_purchase_data()
+    except Exception as e: return out(f'❌ Lecture impossible : {esc(e)}')
+    items=d['rup'] if kind=='R' else d['crit'] if kind=='C' else d['near'] if kind=='N' else d['rup']+d['crit']
+    total=len(items)
+    if not total: return out('✅ Aucun article dans cette catégorie.', inline([back]))
+    pages=(total+ACHAT_PAGE-1)//ACHAT_PAGE; page=max(0,min(page,pages-1))
+    title={'R':'🔴 Ruptures','C':'🟡 Critiques','N':'🟠 Proches du minimum','A':'📋 Articles à acheter'}[kind]
+    body='\n\n'.join(achat_item_text(i) for i in items[page*ACHAT_PAGE:(page+1)*ACHAT_PAGE])
+    nav=[]
+    if page>0: nav.append(btn('◀ Précédent',f'ach:{kind}:{page-1}'))
+    if page<pages-1: nav.append(btn('Suivant ▶',f'ach:{kind}:{page+1}'))
+    rows=([nav] if nav else [])+[back]
+    return out(f'<b>{title}</b> — page {page+1}/{pages} ({total} article(s))\n\n{body}', inline(rows))
+
+def handle_callback(update):
+    cb=update.get('callback_query') or {}; data=cb.get('data',''); user=cb.get('from',{}); uid=user.get('id'); chat_id=(cb.get('message') or {}).get('chat',{}).get('id')
+    mid=(cb.get('message') or {}).get('message_id')
+    ack={'callback_query_id':cb.get('id')}
+    if data.startswith(('rm:','rmp:','ach:')): ack['text']='⏳ Chargement…'
+    try: api('answerCallbackQuery',ack)
+    except Exception: pass
+    role=role_of(uid)
+    if data.startswith('article:'):
+        code=data.split(':',1)[1]
+        if not can_search(role): return send(chat_id,'⛔ Accès refusé.')
+        a=get_article_by_code(code)
+        if not a: return send(chat_id,f'{NOT_FOUND} Article introuvable : <code>{esc(code)}</code>')
+        send_article_details(chat_id, role, a)
+        return
+    if data.startswith('rmp:'):
+        if not can_see_full(role): return send(chat_id,'⛔ Accès réservé à Responsable/Admin.')
+        try: y=int(data[4:])
+        except Exception: return
+        if not 2000<=y<=2100: return
+        return edit_or_send(chat_id, mid, f'📆 <b>Choisissez le mois — {y}</b>', month_picker(y))
+    if data.startswith('rm:'):
+        try:
+            y,m=data[3:].split('-'); y=int(y); m=int(m)
+        except Exception: return
+        if not 1<=m<=12: return
+        return show_month_report(chat_id, role, y, m, message_id=mid)
+    if data.startswith('ach:'):
+        try:
+            _,kind,page=data.split(':'); page=int(page)
+        except Exception: return
+        if kind not in ('R','C','N','A','S'): return
+        if kind=='S':
+            if not can_see_full(role): return send(chat_id,'⛔ Accès réservé à Responsable/Admin.')
+            try: d=get_purchase_data()
+            except Exception as e: return send(chat_id,f'❌ Lecture impossible : {esc(e)}')
+            txt,kb=build_achat_summary(d)
+            return edit_or_send(chat_id, mid, txt, kb)
+        return show_achat_page(chat_id, role, kind, page, message_id=mid)
+    if data=='move_noobs':
+        if not can_move(role): return send(chat_id,'⛔ Accès refusé.')
+        st=get_state(uid)
+        if not st or st.get('step')!='move_obs': return send(chat_id,'Aucune opération en cours. Touchez 📥 Entrée ou 📤 Sortie pour recommencer.')
+        return finish_movement(chat_id, uid, user, role, st, '')
+    if data.startswith('move:'):
+        if not can_move(role): return send(chat_id,'⛔ Accès refusé.')
+        _,kind,code=data.split(':',2); set_state(uid,{'step':'move_qty','kind':kind,'code':code})
+        return send(chat_id,f"Code <code>{esc(code)}</code>. Saisissez la quantité à {kind.lower()}.")
+    if data.startswith(('photo_ok:','photo_no:')):
+        if not can_approve(role): return send(chat_id,'⛔ Seuls Responsable et Admin peuvent valider les photos.')
+        approve=data.startswith('photo_ok:'); pid=data.split(':',1)[1]
+        try:
+            m=resolve_photo(pid,approve,user)
+            send(chat_id,('✅ Photo validée et installée.' if approve else '❌ Photo rejetée; la photo validée précédente est conservée.')+f"\nCode : <code>{esc(m['code'])}</code>")
+            if m.get('sender_id') and str(m['sender_id'])!=str(uid):
+                try: send(m['sender_id'],f"Votre photo pour {m['code']} a été {'validée' if approve else 'rejetée'} par {display_name(user)}.")
+                except Exception: pass
+        except Exception as e: send(chat_id,f'Erreur : {esc(e)}')
+        return
+    if data.startswith(('grant:','revoke:','um:')):
+        # User management: Admin only (a Responsable can validate photos but never manage users).
+        if not is_admin(uid): return send(chat_id,'⛔ Seul Admin peut gérer les utilisateurs et les rôles.')
+        return handle_user_callback(chat_id, uid, data)
+
+# ---------------------------------------------------------------------------------------
+# Admin menu "👥 Utilisateurs": add / remove users, role per user, access requests.
+# Commands (same keywords as the PDF/Word guide): /users, /pending, /revoke ID, /attribuer ID rôle.
+# ---------------------------------------------------------------------------------------
+PENDING_USERS = {}   # access requests: {id: {...}} (memory only, like the previous bot)
+USER_NAMES = {}      # last known display names, only to make lists readable
+ROLE_HELP = {
+    'admin': 'tout, y compris la gestion des utilisateurs',
+    'responsable': 'infos complètes, entrées/sorties, valide les photos',
+    'magasinier': 'infos limitées, entrées/sorties, propose des photos',
+    'maintenance': 'recherche limitée (machine, emplacement), sans mouvements',
+}
+
+def remember_name(user):
+    try:
+        if user.get('id') is not None: USER_NAMES[str(user['id'])] = display_name(user)
+    except Exception: pass
+
+def user_line(uid, role):
+    name = USER_NAMES.get(str(uid)) or (PENDING_USERS.get(str(uid)) or {}).get('name') or ''
+    owner = ' (propriétaire)' if str(uid) == str(OWNER_USER_ID) else ''
+    return f"{uid}{' — ' + name if name else ''} — {ROLE_LABELS.get(role, role)}{owner}"
+
+def admin_ids():
+    return [int(u) for u, r in load_users().items() if r == 'admin' and str(u).isdigit()]
+
+def role_buttons(target, current=None):
+    def b(r): return btn(('✔ ' if r == current else '') + ROLE_LABELS[r], f'grant:{target}:{r}')
+    return [[b('admin'), b('responsable')], [b('magasinier'), b('maintenance')]]
+
+def set_user_role(admin_id, target, newrole):
+    target = str(target).strip()
+    if not target.isdigit(): raise ValueError('ID Telegram invalide (chiffres uniquement).')
+    if target == str(OWNER_USER_ID): raise ValueError('Le compte propriétaire reste Admin.')
+    if newrole not in ROLE_LABELS: raise ValueError('Rôle invalide.')
+    users = load_users(); users[target] = newrole; save_users(users); PENDING_USERS.pop(target, None)
+    log_event('role_granted', admin=admin_id, target=target, role=newrole)
+    refresh_commands_for(target, newrole)
+    try: send(int(target), f"✅ <b>Votre accès à PDR-STOCK est activé.</b>\nRôle : <b>{ROLE_LABELS[newrole]}</b>\nEnvoyez /start pour afficher votre menu.")
+    except Exception: pass   # the person must have started the bot at least once to receive messages
+    return target
+
+def revoke_user(admin_id, target):
+    target = str(target).strip()
+    if not target.isdigit(): raise ValueError('ID Telegram invalide (chiffres uniquement).')
+    if target == str(OWNER_USER_ID): raise ValueError('Le compte propriétaire ne peut pas être révoqué.')
+    users = load_users(); existed = users.pop(target, None) is not None; save_users(users); PENDING_USERS.pop(target, None)
+    log_event('role_revoked', admin=admin_id, target=target)
+    refresh_commands_for(target, None)
+    try:
+        perms = load_photo_perms()
+        if target in perms: perms.discard(target); save_photo_perms(perms)
+    except Exception: pass
+    if existed:
+        try: send(int(target), '⛔ Votre accès à PDR-STOCK a été retiré.')
+        except Exception: pass
+    return existed
+
+def register_access_request(user, chat_id):
+    """Unknown user wrote to the bot: keep the request and notify every Admin once, with role buttons."""
+    uid = str(user.get('id')); name = display_name(user)
+    if uid in PENDING_USERS:
+        PENDING_USERS[uid]['name'] = name
+        return
+    PENDING_USERS[uid] = {'id': user.get('id'), 'name': name, 'username': user.get('username', ''), 'chat_id': chat_id, 'denied': False}
+    uname = f" (@{esc(user.get('username'))})" if user.get('username') else ''
+    for a in admin_ids():
+        try: send(a, f"👤 <b>Nouvelle demande d’accès à PDR-STOCK</b>\nNom : {esc(name)}{uname}\nID : <code>{esc(uid)}</code>\nChoisissez le rôle à accorder :",
+                  inline(role_buttons(uid) + [[btn('🚫 Refuser', f'um:deny:{uid}')]]))
+        except Exception: pass
+
+def user_management(chat_id):
+    users = load_users()
+    npend = sum(1 for p in PENDING_USERS.values() if not p.get('denied'))
+    lines = [f'<b>👥 Utilisateurs autorisés ({len(users)})</b>'] + [f'• {esc(user_line(u, r))}' for u, r in users.items()]
+    lines.append(f'\nDemandes d’accès en attente : <b>{npend}</b>')
+    lines.append('Commandes : /utilisateurs, /pending, /revoke ID, /attribuer ID rôle, /suiviphotos, /operations')
+    send(chat_id, '\n'.join(lines), inline([
+        [btn('➕ Ajouter un utilisateur', 'um:add'), btn('🗑️ Supprimer un utilisateur', 'um:delmenu')],
+        [btn('📋 Modifier le rôle', 'um:list'), btn(f'⏳ Demandes ({npend})', 'um:pend')],
+        [btn('📊 Suivi photos', 'um:phstat'), btn('🕘 Opérations', 'um:ops')]]))
+
+def pending_access(chat_id):
+    items = [p for p in PENDING_USERS.values() if not p.get('denied')]
+    if not items: return send(chat_id, 'Aucune demande d’accès en attente.\nPour ajouter quelqu’un : bouton « ➕ Ajouter un utilisateur » dans le menu Utilisateurs.')
+    for p in items[:20]:
+        uname = f" (@{esc(p.get('username'))})" if p.get('username') else ''
+        send(chat_id, f"👤 <b>Demande d’accès</b>\nNom : {esc(p.get('name'))}{uname}\nID : <code>{p['id']}</code>\nChoisissez le rôle :",
+             inline(role_buttons(p['id']) + [[btn('🚫 Refuser', f"um:deny:{p['id']}")]]))
+
+def handle_user_callback(chat_id, uid, data):
+    users = load_users()
+    if data.startswith('grant:'):
+        parts = data.split(':', 2)
+        if len(parts) != 3: return
+        try: target = set_user_role(uid, parts[1], parts[2])
+        except Exception as e: return send(chat_id, f'{NOT_FOUND} {esc(e)}')
+        return send(chat_id, f"✅ Rôle attribué : <code>{target}</code> → <b>{ROLE_LABELS[parts[2]]}</b>.\n<i>{esc(ROLE_HELP[parts[2]])}</i>")
+    if data.startswith('revoke:'):
+        try: existed = revoke_user(uid, data.split(':', 1)[1])
+        except Exception as e: return send(chat_id, f'{NOT_FOUND} {esc(e)}')
+        return send(chat_id, f"🗑️ Accès supprimé pour <code>{esc(data.split(':',1)[1])}</code>." if existed else 'Cet ID n’était pas autorisé.')
+    if data == 'um:add':
+        set_state(uid, {'step': 'um_add_id'})
+        return send(chat_id, '➕ Envoyez l’<b>ID Telegram</b> (chiffres) de la personne à ajouter.\nLa personne peut aussi envoyer /start au bot : sa demande apparaît alors dans « ⏳ Demandes ».\n/cancel pour annuler.')
+    if data == 'um:pend': return pending_access(chat_id)
+    if data == 'um:list':
+        rows = [[btn(user_line(u, r)[:60], f'um:u:{u}')] for u, r in users.items()]
+        return send(chat_id, '📋 Touchez un utilisateur pour changer son rôle ou le supprimer :', inline(rows))
+    if data == 'um:delmenu':
+        rows = [[btn('🗑️ ' + user_line(u, r)[:55], f'um:del:{u}')] for u, r in users.items() if str(u) != str(OWNER_USER_ID)]
+        if not rows: return send(chat_id, 'Aucun utilisateur à supprimer (le propriétaire ne peut pas être supprimé).')
+        return send(chat_id, '🗑️ Choisissez l’utilisateur à supprimer :', inline(rows))
+    if data.startswith('um:u:'):
+        target = data.split(':', 2)[2]
+        if target not in users: return send(chat_id, f'{NOT_FOUND} Utilisateur introuvable : {esc(target)}')
+        role = users[target]
+        if target == str(OWNER_USER_ID): return send(chat_id, f'👤 {esc(user_line(target, role))}\nLe compte propriétaire ne peut être ni modifié ni supprimé.')
+        extra = []; photo_line = ''
+        if role == 'magasinier':
+            direct = target in load_photo_perms()
+            photo_line = f"\nPhotos : {'✅ publiées sans validation' if direct else '⏳ soumises à validation'}"
+            extra = [[btn(f"📷 Photos sans validation : {'✅ Oui' if direct else '❌ Non'}", f'um:phdir:{target}')]]
+        elif role in ('admin', 'responsable'):
+            photo_line = '\nPhotos : ✅ publiées sans validation (selon le rôle)'
+        return send(chat_id, f"👤 <b>{esc(user_line(target, role))}</b>\nRôle actuel : {esc(ROLE_HELP.get(role, ''))}{photo_line}\nChoisissez le nouveau rôle ou supprimez l’accès :",
+                    inline(role_buttons(target, role) + extra + [[btn('🗑️ Supprimer', f'um:del:{target}'), btn('⬅️ Retour', 'um:list')]]))
+    if data.startswith('um:phdir:'):
+        target = data.split(':', 2)[2]
+        if users.get(target) != 'magasinier': return send(chat_id, 'Cette option concerne uniquement le rôle Magasinier.')
+        perms = load_photo_perms()
+        if target in perms: perms.discard(target)
+        else: perms.add(target)
+        save_photo_perms(perms)
+        log_event('photo_permission', admin=uid, target=target, direct=target in perms)
+        return handle_user_callback(chat_id, uid, f'um:u:{target}')
+    if data == 'um:phstat': return photo_tracking(chat_id)
+    if data.startswith('um:ph:'): return photo_user_detail(chat_id, data.split(':', 2)[2])
+    if data == 'um:ops': return send_operations(chat_id)
+    if data.startswith('um:del:'):
+        target = data.split(':', 2)[2]
+        if target == str(OWNER_USER_ID): return send(chat_id, f'{NOT_FOUND} Le compte propriétaire ne peut pas être supprimé.')
+        return send(chat_id, f"⚠️ Supprimer l’accès de <code>{esc(target)}</code> ({esc(ROLE_LABELS.get(users.get(target), 'inconnu'))}) ?",
+                    inline([[btn('✅ Oui, supprimer', f'revoke:{target}'), btn('Annuler', 'um:list')]]))
+    if data.startswith('um:deny:'):
+        target = data.split(':', 2)[2]
+        if target in PENDING_USERS: PENDING_USERS[target]['denied'] = True
+        log_event('access_denied', admin=uid, target=target)
+        return send(chat_id, f'🚫 Demande refusée pour <code>{esc(target)}</code>.')
+
+def process_text(message):
+    chat=message.get('chat',{}); chat_id=chat.get('id'); user=message.get('from',{}); uid=user.get('id'); text=(message.get('text') or '').strip(); role=role_of(uid)
+    if chat.get('type')!='private': return
+    remember_name(user)
+    if not role:
+        send(chat_id,f"Bonjour {esc(display_name(user))}. Votre accès n’est pas encore autorisé.\n⏳ Votre demande a été envoyée à l’administrateur PDR-STOCK.\nVotre identifiant Telegram : <code>{uid}</code>")
+        log_event('unauthorized_user',user_id=uid,user_name=display_name(user))
+        register_access_request(user, chat_id)
+        return
+    if text.startswith('/cancel'):
+        clear_state(uid); return send(chat_id,'Opération annulée.',main_keyboard(role))
+    if text.startswith('/start') or text.startswith('/menu'):
+        clear_state(uid); send(chat_id,f"Bonjour {esc(display_name(user))} — rôle : <b>{ROLE_LABELS.get(role,role)}</b>.\nChoisissez une fonction dans le menu.\n<i>Version : {BOT_VERSION}</i>",main_keyboard(role)); return
+    HELP_TEXT='Commandes : /start, /menu, /cancel, /search, /entre, /sortie, /aide, /chercher CODE ou désignation, /photoattente (Responsable/Admin), /operations (Responsable/Admin), /rapport et /achats (Responsable/Admin), /utilisateurs, /suiviphotos, /pending, /revoke ID, /attribuer ID rôle (Admin).'
+    if text.startswith('/help'):
+        send(chat_id,HELP_TEXT,main_keyboard(role)); return
+    # Commands shown in the Telegram command menu (BotFather): /search /entre /sortie /aide.
+    # They use the same functions (and role checks) as the keyboard buttons.
+    cmd = text.split()[0].split('@')[0].lower() if text.startswith('/') and text.split() else ''
+    if cmd == '/aide':
+        send(chat_id,HELP_TEXT,main_keyboard(role)); return
+    if cmd == '/search':
+        if not can_search(role): return send(chat_id,'⛔ Accès refusé.')
+        args = text.split(None,1)[1].strip() if len(text.split(None,1))>1 else ''
+        if args: return show_search_results(chat_id,role,args)
+        set_state(uid,{'step':'search_text'})
+        return send(chat_id,'Envoyez le code article ou un mot de la désignation.')
+    if cmd == '/entre': return begin_movement(chat_id,uid,'ENTRÉE')
+    if cmd == '/sortie': return begin_movement(chat_id,uid,'SORTIE')
+    if cmd in ('/users','/utilisateurs','/utilisateur'):
+        if not is_admin(uid): return send(chat_id,'⛔ Commande réservée à Admin.')
+        return user_management(chat_id)
+    if cmd == '/suiviphotos':
+        if not is_admin(uid): return send(chat_id,'⛔ Commande réservée à Admin.')
+        return photo_tracking(chat_id)
+    if cmd == '/operations':
+        if not can_see_full(role): return send(chat_id,'⛔ Commande réservée à Responsable/Admin.')
+        return send_operations(chat_id)
+    if cmd == '/rapport': clear_state(uid); return show_month_report(chat_id,role)
+    if cmd == '/achats': clear_state(uid); return show_achat_summary(chat_id,role)
+    if cmd == '/pending' and is_admin(uid):
+        return pending_access(chat_id)          # guide: /pending = access requests waiting for the Admin
+    if text.startswith('/photoattente') or text.startswith('/pending'):
+        if not can_approve(role): return send(chat_id,'⛔ Accès réservé à Responsable/Admin.')
+        return pending_menu(chat_id)            # photos waiting for validation
+    if text.startswith('/attribuer') or text.startswith('/grant'):
+        if not is_admin(uid): return send(chat_id,'⛔ Commande réservée à Admin.')
+        parts=text.split()
+        if len(parts)!=3 or parts[2].lower() not in ROLE_LABELS: return send(chat_id,'Format : /attribuer ID admin|responsable|magasinier|maintenance')
+        try: target=set_user_role(uid,parts[1],parts[2].lower())
+        except Exception as e: return send(chat_id,f'{NOT_FOUND} {esc(e)}')
+        return send(chat_id,f'✅ Accès attribué à {target} : {ROLE_LABELS[parts[2].lower()]}.')
+    if text.startswith('/revoquer') or text.startswith('/revoke'):
+        if not is_admin(uid): return send(chat_id,'⛔ Commande réservée à Admin.')
+        parts=text.split()
+        if len(parts)!=2: return send(chat_id,'Format : /revoke ID  (ex. /revoke 123456789)')
+        try: existed=revoke_user(uid,parts[1])
+        except Exception as e: return send(chat_id,f'{NOT_FOUND} {esc(e)}')
+        return send(chat_id,f'🗑️ Accès révoqué : {parts[1]}.' if existed else f'{NOT_FOUND} Cet ID n’est pas dans la liste : {esc(parts[1])}')
+    if text.startswith('/chercher '): return show_search_results(chat_id,role,text.split(' ',1)[1]) if can_search(role) else send(chat_id,'⛔ Accès refusé.')
+    state=get_state(uid)
+    if text in ('🔎 Rechercher article','📷 Recherche par photo','📷 Scanner QR'):
+        if not can_search(role): return send(chat_id,'⛔ Accès refusé.')
+        set_state(uid,{'step':'search_text' if text=='🔎 Rechercher article' else ('image_search' if text=='📷 Recherche par photo' else 'qr_scan')})
+        return send(chat_id,'Envoyez le code article ou un mot de la désignation.' if text=='🔎 Rechercher article' else ('Envoyez une photo de la pièce pour comparer aux photos validées.' if text=='📷 Recherche par photo' else 'Envoyez une photo nette du QR code.'))
+    if text=='📥 Entrée': return begin_movement(chat_id,uid,'ENTRÉE')
+    if text=='📤 Sortie': return begin_movement(chat_id,uid,'SORTIE')
+    if text=='🖼️ Envoyer une photo': return begin_photo(chat_id,uid)
+    if text=='📅 Rapport mensuel': clear_state(uid); return show_month_report(chat_id,role)
+    if text=='🛒 Alertes achat': clear_state(uid); return show_achat_summary(chat_id,role)
+    if text=='🕓 Photos en attente':
+        if not can_approve(role): return send(chat_id,'⛔ Accès refusé.')
+        return pending_menu(chat_id)
+    if text=='👥 Utilisateurs':
+        if not is_admin(uid): return send(chat_id,'⛔ Accès refusé.')
+        return user_management(chat_id)
+    if state:
+        step=state.get('step')
+        if step in ('search_text','qr_scan'):
+            clear_state(uid); return show_search_results(chat_id,role,text)
+        if step=='move_code':
+            a=get_article_by_code(text)
+            if not a: return send(chat_id,f'{NOT_FOUND} <b>Code introuvable</b> : <code>{esc(text)}</code>\nRéessayez ou /menu pour annuler.')
+            state.update(step='move_qty',code=a['code']); set_state(uid,state)
+            return send(chat_id,f"Article : <b>{esc(a['designation'])}</b>\nSaisissez la quantité pour {state['kind']}.")
+        if step=='move_qty':
+            try:
+                qty=float(text.replace(',','.'))
+                if qty<=0: raise ValueError()
+            except Exception: return send(chat_id,'Saisissez une quantité numérique supérieure à zéro.')
+            state['qty']=qty; state['step']='move_bon'; set_state(uid,state)
+            return send(chat_id,'Saisissez le N° Bon (ou - si absent).')
+        if step=='move_bon':
+            state['bon']='' if text=='-' else text; state['step']='move_obs'; set_state(uid,state)
+            return send(chat_id,'Observation ? Écrivez-la, ou touchez le bouton s’il n’y en a pas.',inline([[btn('➖ Sans observation','move_noobs')]]))
+        if step=='move_obs':
+            return finish_movement(chat_id, uid, user, role, state, '' if text=='-' else text)
+        if step=='photo_wait':
+            # If they send text first, remember code for the next photo.
+            state['code']=text; set_state(uid,state); return send(chat_id,f"Code mémorisé : <code>{esc(text)}</code>. Envoyez maintenant la photo.")
+    # default free-text search
+    if can_search(role): return show_search_results(chat_id,role,text)
+    send(chat_id,'Choisissez une option dans le menu.')
+
+def process_photo(message):
+    chat=message.get('chat',{}); chat_id=chat.get('id'); user=message.get('from',{}); uid=user.get('id'); role=role_of(uid)
+    if chat.get('type')!='private': return
+    if not role: return send(chat_id,f'Accès non autorisé. Votre ID Telegram : <code>{uid}</code>')
+    state=get_state(uid) or {}; file_id=photo_file_from_message(message)
+    if not file_id: return send(chat_id,'Aucune photo exploitable détectée.')
+    try: data=get_file_bytes(file_id)
+    except Exception as e: return send(chat_id,f'Impossible de télécharger la photo : {esc(e)}')
+    caption=(message.get('caption') or '').strip()
+    # QR decode is available for all search roles; QR content is not trusted until article is found.
+    qr=decode_qr(data); qr_code=parse_code_from_qr(qr) if qr else ''
+    if state.get('step')=='image_search' or (not state and caption.lower().startswith('/image')):
+        clear_state(uid)
+        matches=image_search(data)
+        if not matches: return send(chat_id,f'{NOT_FOUND} <b>Aucune photo à comparer</b> dans le dossier IMAGES (ou image illisible).')
+        arts=articles_by_codes([c for c,_ in matches])
+        best_code,best_d=matches[0]
+        second_d=matches[1][1] if len(matches)>1 else 99
+        exact = best_d<=IMAGE_EXACT_MAX and (second_d-best_d)>=IMAGE_EXACT_GAP and norm(best_code) in arts
+        def rows_for(items, star_first):
+            rows=[[btn((article_label(arts[norm(c)]) if norm(c) in arts else c), f'article:{c}')] for c,_ in items]
+            if star_first and rows:
+                rows[0][0]['text']='⭐ '+rows[0][0]['text']      # best guess stands out; Telegram may also colour it (style)
+                rows[0][0]['style']='success'
+            return rows
+        def send_rows(text, rows):
+            try: return send(chat_id, text, inline(rows))
+            except Exception:                                      # clients/API versions that reject 'style': resend plainly
+                for r in rows:
+                    for b in r: b.pop('style', None)
+                return send(chat_id, text, inline(rows))
+        if exact:
+            # Same part recognised: show it directly (card + photo), then the similar ones as lines.
+            send(chat_id, '✅ <b>Pièce reconnue</b> (ressemblance forte avec la photo validée) :')
+            send_article_details(chat_id, role, arts[norm(best_code)])
+            rest=matches[1:]
+            if rest: send_rows('🔁 <b>Pièces similaires</b> — touchez une ligne pour voir la photo et les informations :', rows_for(rest, False))
+            return
+        weak = best_d > 18   # 8x8 perceptual hash distance: > 18 of 64 bits = weak resemblance
+        head = (f'⚠️ <b>Aucune ressemblance forte</b> — voici les {len(matches)} photos les plus proches :' if weak
+                else f'📷 <b>{len(matches)} photo(s) les plus proches</b> (⭐ = la plus proche) :')
+        return send_rows(head+'\nTouchez une ligne pour voir la photo et les informations. La recherche compare visuellement les photos du dossier IMAGES (ce n’est pas une reconnaissance IA).', rows_for(matches, True))
+    if state.get('step')=='qr_scan' or qr:
+        clear_state(uid)
+        code=qr_code or caption
+        if not code: return send(chat_id,'QR détecté mais code article non reconnu. Envoyez le code en texte.')
+        return show_search_results(chat_id,role,code)
+    if state.get('step')=='photo_wait' and can_submit_photo(role):
+        if not can_submit_photo(role): return send(chat_id,'⛔ Votre rôle ne peut pas envoyer de photo.')
+        code=caption or state.get('code','')
+        if not code:
+            set_state(uid,{'step':'photo_code_pending','photo_data':None})
+            # Store the bytes temporarily under an opaque temp name so user can supply code in next message.
+            tmp='upload_'+hashlib.sha1(os.urandom(16)).hexdigest()+'.jpg'; (PENDING_DIR/tmp).write_bytes(data)
+            set_state(uid,{'step':'photo_code_pending','tmp':tmp})
+            return send(chat_id,'Photo reçue. Envoyez maintenant le code article exact associé à cette photo.')
+        return submit_photo_flow(chat_id, uid, user, role, code, data, caption)
+    clear_state(uid)
+    send(chat_id,'Photo reçue mais aucune opération photo n’était en cours. Pour rechercher, choisissez « 📷 Recherche par photo » ou « 📷 Scanner QR ». Pour proposer une photo, choisissez « 🖼️ Envoyer une photo ».')
+
+def handle_update(update):
+    if 'callback_query' in update: return handle_callback(update)
+    message=update.get('message')
+    if not message: return
+    # Complete two-step photo submission when code arrives after the photo.
+    user=message.get('from',{}); uid=user.get('id'); text=(message.get('text') or '').strip(); state=get_state(uid) or {}
+    if text and state.get('step')=='photo_code_pending':
+        tmp=state.get('tmp'); p=PENDING_DIR/(tmp or '')
+        if not p.exists(): clear_state(uid); return send(message['chat']['id'],'Photo temporaire introuvable. Merci de renvoyer la photo.')
+        data=p.read_bytes()
+        if submit_photo_flow(message['chat']['id'], uid, user, role_of(uid), text, data, ''): p.unlink(missing_ok=True)
+        return
+    if message.get('photo'): return process_photo(message)
+    if message.get('text'): return process_text(message)
+
+def main():
+    print('PDR-STOCK bot démarrage…')
+    log_event('bot_start', version=BOT_VERSION, file=str(Path(__file__).resolve()))
+    print(f'Classeur attendu : {EXCEL_FILE}')
+    print(f'Compte propriétaire Admin : {OWNER_USER_ID}')
+    setup_commands()
+    offset=0
+    try:
+        if OFFSET_FILE.exists(): offset=int(OFFSET_FILE.read_text(encoding='utf-8').strip() or 0)
+    except Exception: offset=0
+    while True:
+        try:
+            updates=api('getUpdates',{'offset':offset,'timeout':25,'allowed_updates':['message','callback_query']},timeout=35)
+            for u in updates or []:
+                offset=max(offset,int(u['update_id'])+1)
+                try: handle_update(u)
+                except Exception as e:
+                    tb=traceback.format_exc()
+                    log_event('handler_error',error=repr(e),trace=tb[-4000:])
+                    log_error(f'{datetime.now().isoformat(timespec="seconds")} | handler_error | {repr(e)}\n{tb}')
+                    msg=u.get('message') or (u.get('callback_query') or {}).get('message') or {}
+                    if msg.get('chat',{}).get('id'):
+                        try: send(msg['chat']['id'],f'Erreur technique : {esc(e)}\nDétail enregistré dans bot_errors.log / bot_audit.jsonl.')
+                        except Exception: pass
+                try: OFFSET_FILE.write_text(str(offset),encoding='utf-8')
+                except Exception: pass
+        except KeyboardInterrupt: print('Arrêt demandé.'); break
+        except Exception as e:
+            line=f'{datetime.now().isoformat(timespec="seconds")} | {repr(e)}\n{traceback.format_exc()}\n'
+            log_error(line)
+            print(line); time.sleep(5)
+
+if __name__=='__main__':
+    main()
